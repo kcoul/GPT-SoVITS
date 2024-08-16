@@ -14,3 +14,10 @@ GPT_weights_v2
 SoVITS_weights_v2
 TEMP
 weight.json
+
+
+onnx/*
+out1.wav
+out2.wav
+pretrained_models
+rec.wav

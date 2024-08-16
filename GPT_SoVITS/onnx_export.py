@@ -1,17 +1,20 @@
+import librosa
+import os
 from module.models_onnx import SynthesizerTrn, symbols
 from AR.models.t2s_lightning_module_onnx import Text2SemanticLightningModule
 import torch
 import torchaudio
 from torch import nn
 from feature_extractor import cnhubert
-cnhubert_base_path = "pretrained_models/chinese-hubert-base"
+
+cnhubert_base_path = "GPT_SoVITS/pretrained_models/chinese-hubert-base"
 cnhubert.cnhubert_base_path=cnhubert_base_path
 ssl_model = cnhubert.get_model()
 from text import cleaned_text_to_sequence
 import soundfile
 from tools.my_utils import load_audio
-import os
 import json
+import text.cleaner
 
 def spectrogram_torch(y, n_fft, sampling_rate, hop_size, win_size, center=False):
     hann_window = torch.hann_window(win_size).to(
@@ -121,7 +124,10 @@ class T2SModel(nn.Module):
             y, k, v, y_emb, logits, samples = enco
             if early_stop_num != -1 and (y.shape[1] - prefix_len) > early_stop_num:
                 stop = True
-            if torch.argmax(logits, dim=-1)[0] == self.t2s_model.EOS or samples[0, 0] == self.t2s_model.EOS:
+            argmax = torch.argmax(logits, dim=-1)[0]
+            first_sample = samples[0, 0]
+            # print("argmax is: ", argmax)
+            if argmax == self.t2s_model.EOS or first_sample == self.t2s_model.EOS:
                 stop = True
             if stop:
                 break
@@ -148,28 +154,33 @@ class T2SModel(nn.Module):
             input_names=["ref_seq", "text_seq", "ref_bert", "text_bert", "ssl_content"],
             output_names=["x", "prompts"],
             dynamic_axes={
-                "ref_seq": {1 : "ref_length"},
-                "text_seq": {1 : "text_length"},
-                "ref_bert": {0 : "ref_length"},
-                "text_bert": {0 : "text_length"},
-                "ssl_content": {2 : "ssl_length"},
+                "ref_seq": {1: "ref_length"},
+                "text_seq": {1: "text_length"},
+                "ref_bert": {0: "ref_length"},
+                "text_bert": {0: "text_length"},
+                "ssl_content": {2: "ssl_length"},
             },
-            opset_version=16
+            opset_version=17
         )
         x, prompts = self.onnx_encoder(ref_seq, text_seq, ref_bert, text_bert, ssl_content)
+
+        top_k = self.t2s_model.top_k
+        top_p = 1
+        temperature = 1
+        repetition_penalty = 1.35
 
         torch.onnx.export(
             self.first_stage_decoder,
             (x, prompts),
             f"onnx/{project_name}/{project_name}_t2s_fsdec.onnx",
-            input_names=["x", "prompts"],
+            input_names=["x", "prompts", "top_k", "top_p", "temperature", "repetition_penalty"],
             output_names=["y", "k", "v", "y_emb", "x_example"],
             dynamic_axes={
-                "x": {1 : "x_length"},
-                "prompts": {1 : "prompts_length"},
+                "x": {1: "x_length"},
+                "prompts": {1: "prompts_length"},
             },
             verbose=False,
-            opset_version=16
+            opset_version=17
         )
         y, k, v, y_emb, x_example = self.first_stage_decoder(x, prompts)
 
@@ -177,17 +188,17 @@ class T2SModel(nn.Module):
             self.stage_decoder,
             (y, k, v, y_emb, x_example),
             f"onnx/{project_name}/{project_name}_t2s_sdec.onnx",
-            input_names=["iy", "ik", "iv", "iy_emb", "ix_example"],
+            input_names=["iy", "ik", "iv", "iy_emb", "ix_example", "top_k", "top_p", "temperature", "repetition_penalty"],
             output_names=["y", "k", "v", "y_emb", "logits", "samples"],
             dynamic_axes={
-                "iy": {1 : "iy_length"},
-                "ik": {1 : "ik_length"},
-                "iv": {1 : "iv_length"},
-                "iy_emb": {1 : "iy_emb_length"},
-                "ix_example": {1 : "ix_example_length"},
+                "iy": {1: "iy_length"},
+                "ik": {1: "ik_length"},
+                "iv": {1: "iv_length"},
+                "iy_emb": {1: "iy_emb_length"},
+                "ix_example": {1: "ix_example_length"},
             },
             verbose=False,
-            opset_version=16
+            opset_version=17
         )
 
 
@@ -198,14 +209,19 @@ class VitsModel(nn.Module):
         self.hps = dict_s2["config"]
         self.hps = DictToAttrRecursive(self.hps)
         self.hps.model.semantic_frame_rate = "25hz"
+        if dict_s2['weight']['enc_p.text_embedding.weight'].shape[0] == 322:
+            self.hps.model.version = "v1"
+        else:
+            self.hps.model.version = "v2"
         self.vq_model = SynthesizerTrn(
             self.hps.data.filter_length // 2 + 1,
             self.hps.train.segment_size // self.hps.data.hop_length,
             n_speakers=self.hps.data.n_speakers,
+            # version=self.hps.model.version,
             **self.hps.model
         )
         self.vq_model.eval()
-        self.vq_model.load_state_dict(dict_s2["weight"], strict=False)
+        print(self.vq_model.load_state_dict(dict_s2["weight"], strict=False))
         
     def forward(self, text_seq, pred_semantic, ref_audio):
         refer = spectrogram_torch(
@@ -230,7 +246,7 @@ class GptSoVits(nn.Module):
         audio = self.vits(text_seq, pred_semantic, ref_audio)
         if debug:
             import onnxruntime
-            sess = onnxruntime.InferenceSession("onnx/koharu/koharu_vits.onnx", providers=["CPU"])
+            sess = onnxruntime.InferenceSession("onnx/nahida/nahida_vits.onnx", providers=["CPUExecutionProvider"])
             audio1 = sess.run(None, {
                 "text_seq" : text_seq.detach().cpu().numpy(),
                 "pred_semantic" : pred_semantic.detach().cpu().numpy(), 
@@ -266,20 +282,41 @@ class SSLModel(nn.Module):
     def forward(self, ref_audio_16k):
         return self.ssl.model(ref_audio_16k)["last_hidden_state"].transpose(1, 2)
 
+    def export(self, ref_audio_16k, project_name):
+        self.ssl.model.eval()
+        torch.onnx.export(
+            self,
+            (ref_audio_16k),
+            f"onnx/{project_name}/{project_name}_cnhubert.onnx",
+            input_names=["ref_audio_16k"],
+            output_names=["last_hidden_state"],
+            dynamic_axes={
+                "ref_audio_16k": {1 : "text_length"},
+                "last_hidden_state": {2 : "pred_length"}
+            },
+            opset_version=17,
+            verbose=False
+        )
 
 def export(vits_path, gpt_path, project_name):
     vits = VitsModel(vits_path)
     gpt = T2SModel(gpt_path, vits)
     gpt_sovits = GptSoVits(vits, gpt)
     ssl = SSLModel()
-    ref_seq = torch.LongTensor([cleaned_text_to_sequence(["n", "i2", "h", "ao3", ",", "w", "o3", "sh", "i4", "b", "ai2", "y", "e4"])])
-    text_seq = torch.LongTensor([cleaned_text_to_sequence(["w", "o3", "sh", "i4", "b", "ai2", "y", "e4", "w", "o3", "sh", "i4", "b", "ai2", "y", "e4", "w", "o3", "sh", "i4", "b", "ai2", "y", "e4"])])
-    ref_bert = torch.randn((ref_seq.shape[1], 1024)).float()
-    text_bert = torch.randn((text_seq.shape[1], 1024)).float()
-    ref_audio = torch.randn((1, 48000 * 5)).float()
-    # ref_audio = torch.tensor([load_audio("rec.wav", 48000)]).float()
-    ref_audio_16k = torchaudio.functional.resample(ref_audio,48000,16000).float()
-    ref_audio_sr = torchaudio.functional.resample(ref_audio,48000,vits.hps.data.sampling_rate).float()
+    text_phones, word2ph, norm_text = text.cleaner.clean_text("Oh! I didn't realize you were there! Hello there, how are you doing today?", "en")
+    ref_phones, word2ph2, norm_text2 = text.cleaner.clean_text(
+    "We interrupt this broadcast with this urgent message. As of today, from advice from the health secretary, and other governing bodies",
+"en")
+    text_seq = torch.LongTensor([cleaned_text_to_sequence(text_phones)])
+    ref_seq = torch.LongTensor([cleaned_text_to_sequence(ref_phones)])
+    text_bert = torch.zeros((len(text_phones), 1024), dtype=torch.float32)
+    ref_bert = torch.zeros((len(ref_phones), 1024), dtype=torch.float32)
+
+    # ref_audio = torch.randn((1, 48000 * 5)).float()
+    wav48k, sr = librosa.load("rec.wav", sr=48000)
+    ref_audio = torch.tensor([wav48k]).float()
+    ref_audio_16k = torchaudio.functional.resample(ref_audio, 48000, 16000).float()
+    ref_audio_sr = torchaudio.functional.resample(ref_audio, 48000, vits.hps.data.sampling_rate).float()
 
     try:
         os.mkdir(f"onnx/{project_name}")
@@ -288,18 +325,17 @@ def export(vits_path, gpt_path, project_name):
 
     ssl_content = ssl(ref_audio_16k).float()
     
-    debug = False
+    debug = True
 
     if debug:
         a, b = gpt_sovits(ref_seq, text_seq, ref_bert, text_bert, ref_audio_sr, ssl_content, debug=debug)
         soundfile.write("out1.wav", a.cpu().detach().numpy(), vits.hps.data.sampling_rate)
         soundfile.write("out2.wav", b[0], vits.hps.data.sampling_rate)
-        return
     
-    a = gpt_sovits(ref_seq, text_seq, ref_bert, text_bert, ref_audio_sr, ssl_content).detach().cpu().numpy()
+    # a = gpt_sovits(ref_seq, text_seq, ref_bert, text_bert, ref_audio_sr, ssl_content).detach().cpu().numpy()
+    # soundfile.write("out.wav", a, vits.hps.data.sampling_rate)
 
-    soundfile.write("out.wav", a, vits.hps.data.sampling_rate)
-
+    ssl.export(ref_audio_16k, project_name)
     gpt_sovits.export(ref_seq, text_seq, ref_bert, text_bert, ref_audio_sr, ssl_content, project_name)
 
     MoeVSConf = {
@@ -315,9 +351,9 @@ def export(vits_path, gpt_path, project_name):
             "AddBlank": False
         }
     
-    MoeVSConfJson = json.dumps(MoeVSConf)
-    with open(f"onnx/{project_name}.json", 'w') as MoeVsConfFile:
-        json.dump(MoeVSConf, MoeVsConfFile, indent = 4)
+    # MoeVSConfJson = json.dumps(MoeVSConf)
+    # with open(f"onnx/{project_name}.json", 'w') as MoeVsConfFile:
+    #    json.dump(MoeVSConf, MoeVsConfFile, indent = 4)
 
 
 if __name__ == "__main__":
@@ -326,8 +362,10 @@ if __name__ == "__main__":
     except:
         pass
 
-    gpt_path = "GPT_weights/nahida-e25.ckpt"
-    vits_path = "SoVITS_weights/nahida_e30_s3930.pth"
+    # gpt_path = "GPT_SoVITS/pretrained_models/v1/s1bert25hz-2kh-longer-epoch=68e-step=50232.ckpt"  # V1
+    # vits_path = "GPT_SoVITS/pretrained_models/v1/s2G488k.pth"  # V1
+    gpt_path = "GPT_SoVITS/pretrained_models/gsv-v2final-pretrained/s1bert25hz-5kh-longer-epoch=12-step=369668.ckpt"  # V2
+    vits_path = "GPT_SoVITS/pretrained_models/gsv-v2final-pretrained/s2G2333k.pth"  # V2
     exp_path = "nahida"
     export(vits_path, gpt_path, exp_path)
 
