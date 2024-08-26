@@ -1,6 +1,7 @@
 import librosa
 import os
-from module.models_onnx import SynthesizerTrn, symbols
+from module.models_onnx import SynthesizerTrn
+from text import symbols2 as symbols_v2
 from AR.models.t2s_lightning_module_onnx import Text2SemanticLightningModule
 import torch
 import torchaudio
@@ -209,15 +210,14 @@ class VitsModel(nn.Module):
         self.hps = dict_s2["config"]
         self.hps = DictToAttrRecursive(self.hps)
         self.hps.model.semantic_frame_rate = "25hz"
-        if dict_s2['weight']['enc_p.text_embedding.weight'].shape[0] == 322:
-            self.hps.model.version = "v1"
-        else:
-            self.hps.model.version = "v2"
+        # if dict_s2['weight']['enc_p.text_embedding.weight'].shape[0] == 322:
+        #    self.hps.model.version = "v1"
+        # else:
+        #    self.hps.model.version = "v2"
         self.vq_model = SynthesizerTrn(
             self.hps.data.filter_length // 2 + 1,
             self.hps.train.segment_size // self.hps.data.hop_length,
             n_speakers=self.hps.data.n_speakers,
-            # version=self.hps.model.version,
             **self.hps.model
         )
         self.vq_model.eval()
@@ -232,7 +232,7 @@ class VitsModel(nn.Module):
             self.hps.data.win_length,
             center=False
         )
-        return self.vq_model(pred_semantic, text_seq, refer)[0, 0]
+        return self.vq_model.decode(pred_semantic, text_seq, refer)[0, 0]
 
 
 class GptSoVits(nn.Module):
@@ -303,7 +303,7 @@ def export(vits_path, gpt_path, project_name):
     gpt = T2SModel(gpt_path, vits)
     gpt_sovits = GptSoVits(vits, gpt)
     ssl = SSLModel()
-    text_phones, word2ph, norm_text = text.cleaner.clean_text("Oh! I didn't realize you were there! Hello there, how are you doing today?", "en")
+    text_phones, word2ph, norm_text = text.cleaner.clean_text("Hello there! How are you doing today?", "en")
     ref_phones, word2ph2, norm_text2 = text.cleaner.clean_text(
     "We interrupt this broadcast with this urgent message. As of today, from advice from the health secretary, and other governing bodies",
 "en")
@@ -347,7 +347,7 @@ def export(vits_path, gpt_path, project_name):
             "EmbeddingDim": gpt.t2s_model.embedding_dim,
             "Dict": "BasicDict",
             "BertPath": "chinese-roberta-wwm-ext-large",
-            "Symbol": symbols,
+            "Symbol": symbols_v2,
             "AddBlank": False
         }
     
