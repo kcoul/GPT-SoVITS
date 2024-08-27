@@ -210,10 +210,10 @@ class VitsModel(nn.Module):
         self.hps = dict_s2["config"]
         self.hps = DictToAttrRecursive(self.hps)
         self.hps.model.semantic_frame_rate = "25hz"
-        # if dict_s2['weight']['enc_p.text_embedding.weight'].shape[0] == 322:
-        #    self.hps.model.version = "v1"
-        # else:
-        #    self.hps.model.version = "v2"
+        if dict_s2['weight']['enc_p.text_embedding.weight'].shape[0] == 322:
+           self.hps.model.version = "v1"
+        else:
+           self.hps.model.version = "v2"
         self.vq_model = SynthesizerTrn(
             self.hps.data.filter_length // 2 + 1,
             self.hps.train.segment_size // self.hps.data.hop_length,
@@ -258,6 +258,7 @@ class GptSoVits(nn.Module):
     def export(self, ref_seq, text_seq, ref_bert, text_bert, ref_audio, ssl_content, project_name):
         self.t2s.export(ref_seq, text_seq, ref_bert, text_bert, ssl_content, project_name)
         pred_semantic = self.t2s(ref_seq, text_seq, ref_bert, text_bert, ssl_content)
+        # torch.onnx.dynamo_export could be an option if it can resolve fixed output size issue
         torch.onnx.export(
             self.vits,
             (text_seq, pred_semantic, ref_audio),
